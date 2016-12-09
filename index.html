@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+
+  <head>
+    <meta charset='utf-8'>
+    <meta http-equiv="X-UA-Compatible" content="chrome=1">
+    <meta name="description" content="How F# delighted this newbie while experimenting with distributed systems : F# Advent Post 2016">
+
+    <link rel="stylesheet" type="text/css" media="screen" href="stylesheets/stylesheet.css">
+
+    <title>How F# delighted this newbie while experimenting with distributed systems</title>
+  </head>
+
+  <body>
+
+    <!-- HEADER -->
+    <div id="header_wrap" class="outer">
+        <header class="inner">
+          <a id="forkme_banner" href="https://github.com/hussam/fsadvent16">View on GitHub</a>
+
+          <h1 id="project_title">How F# delighted this newbie while experimenting with distributed systems</h1>
+          <h2 id="project_tagline">F# Advent Post 2016</h2>
+
+            <section id="downloads">
+              <a class="zip_download_link" href="https://github.com/hussam/fsadvent16/zipball/master">Download this project as a .zip file</a>
+              <a class="tar_download_link" href="https://github.com/hussam/fsadvent16/tarball/master">Download this project as a tar.gz file</a>
+            </section>
+        </header>
+    </div>
+
+    <!-- MAIN CONTENT -->
+    <div id="main_content_wrap" class="outer">
+      <section id="main_content" class="inner">
+        <p>A few months ago, I was researching routing and load balancing strategies in distributed systems. Given a set of servers and a stream of incoming client requests, how should the requests be spread across the different servers?<em>(assuming that any server can handle any request)</em>. Intuitively, the answer depends on a multitude of factors such as whether requests are CPU or IO bound, the existing load at each of the servers, the processing power of the different servers, whether we are optimizing for response latency or throughput, whether we can cache results of previous requests, and many more complications that make this deceptively easy question hard to answer in practice.</p>
+
+<p>In situations like this, it is often helpful to reduce the problem to a simpler version that allows us to poke and play with it until we're comfortable adding more complications back into the mix. So, here's a very simple version of this problem: assume that all the servers are identical, and a client's request simply makes the server thread sleep for a few milliseconds depending on a <em>"job size"</em> defined in the request payload. Each server can only <em>"process"</em> one request at a time, and while a server is processing a request job, it buffers incoming requests in a work queue for future processing. Client requests are funneled through a load balancer that periodically probes the length of the work queue at each of the servers. Client requests have different job sizes, but the load balancer isn't aware of them. The load balancer routes requests to servers in the order it receives them, and its goal is to minimize the aggregate queueing delay that's experienced by client requests.</p>
+
+<h3>
+<a id="f-experiment-harness" class="anchor" href="#f-experiment-harness" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>F# Experiment Harness</h3>
+
+<p>For <a href="https://sergeytihon.wordpress.com/2016/10/23/f-advent-calendar-in-english-2016/">F# 2016 Advent Calendar</a>, I wanted to share my prototype code that I used to play with this problem and highlight a couple of things that I thought were pretty cool. The code is available <a href="https://github.com/hussam/fsadvent16">here</a>. The program instantiates a set of servers and clients that communicate using UDP, servers process requests using a <code>MailboxProcessor</code>, and the experiment harness runs the clients using different configurations and plots the results using <a href="https://fslab.org/FSharp.Charting/fsharpcharting.html">F# Charting</a>. The things I want to highlight are not necessarily sophisticated, but as an F# newbie, I thought they were pretty damn cool!</p>
+
+<h5>
+<a id="cool-thing-1-async-workflows" class="anchor" href="#cool-thing-1-async-workflows" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Cool thing #1: Async Workflows</h5>
+
+<p>Expressing the UDP sending and receiving loops of clients and servers was incredibly easy using asynchronous workflows. I could run these workflows in parallel, and even have the receive loop collect results and return them. Wooot! For example, here's the code for my client:</p>
+
+<div class="highlight highlight-source-fsharp"><pre><span class="pl-k">let</span> <span class="pl-smi">sender</span> <span class="pl-k">=</span> <span class="pl-k">async {</span>
+   <span class="pl-k">use</span> socket <span class="pl-k">=</span> <span class="pl-k">new</span> UdpClient<span class="pl-c1">()</span>
+   <span class="pl-k">for</span> i <span class="pl-k">in</span> <span class="pl-c1">1.</span>.msgsToSend <span class="pl-k">do</span>
+      <span class="pl-c">// Pick the server to which the request will be forwarded</span>
+      <span class="pl-k">let</span> <span class="pl-smi">targetIndex, probabilityOfSelection</span> <span class="pl-k">=</span> routingFunc(queueLengths)
+      <span class="pl-k">let</span> <span class="pl-smi">serverHostname, serverPort, _</span> <span class="pl-k">=</span> queueLengths.<span class="pl-k">[</span>targetIndex<span class="pl-k">]</span>
+
+      <span class="pl-c">// Send the message to the server and measure the extra delay</span>
+      <span class="pl-k">let</span> <span class="pl-smi">jobSize</span> <span class="pl-k">=</span> rand.Next(minJobSize, maxJobSize)
+      <span class="pl-k">let</span> <span class="pl-smi">sendTime</span> <span class="pl-k">=</span> timer.ElapsedMilliseconds
+      <span class="pl-k">let</span> <span class="pl-smi">msg</span> <span class="pl-k">=</span> Array.concat <span class="pl-k">[|</span> BitConverter.GetBytes(jobSize)<span class="pl-k">;</span> BitConverter.GetBytes(i)<span class="pl-k">;</span> BitConverter.GetBytes(port) <span class="pl-k">|]</span>
+      socket.Send(msg, msg.Length, serverHostname, serverPort) <span class="pl-k">|&gt;</span> ignore
+
+      jobsInFlight.<span class="pl-k">[</span>i<span class="pl-k">]</span> <span class="pl-k">&lt;-</span> (featurize(queueLengths), jobSize, targetIndex, probabilityOfSelection, sendTime)
+   <span class="pl-k">return</span> None
+<span class="pl-k">}</span>
+
+<span class="pl-k">let</span> <span class="pl-smi">receiver</span> <span class="pl-k">=</span> <span class="pl-k">async {</span>
+   <span class="pl-k">use</span> socket <span class="pl-k">=</span> <span class="pl-k">new</span> UdpClient(port)
+   <span class="pl-k">let</span> <span class="pl-smi">results</span> <span class="pl-k">=</span> <span class="pl-k">new</span> List<span class="pl-k">&lt;_&gt;</span><span class="pl-c1">()</span>
+   <span class="pl-k">let</span> <span class="pl-smi">anySender</span> <span class="pl-k">=</span> <span class="pl-k">new</span> IPEndPoint(IPAddress.Any, <span class="pl-c1">0</span>)
+   while results.Count <span class="pl-k">&lt;</span> msgsToSend <span class="pl-k">do</span>
+      <span class="pl-k">let</span> <span class="pl-smi">bytes</span> <span class="pl-k">=</span> socket.Receive(ref anySender)
+      <span class="pl-k">let</span> <span class="pl-smi">endTime</span> <span class="pl-k">=</span> timer.ElapsedMilliseconds
+      <span class="pl-k">let</span> <span class="pl-smi">jobId</span> <span class="pl-k">=</span> BitConverter.ToInt32(bytes, <span class="pl-c1">4</span>)
+
+      let (qlens, jobSize, selectedServerIdx, p, sendTime) <span class="pl-k">=</span> jobsInFlight.<span class="pl-k">[</span>jobId<span class="pl-k">]</span>
+      <span class="pl-k">let</span> <span class="pl-smi">delay</span> <span class="pl-k">=</span> int(endTime <span class="pl-k">-</span> sendTime <span class="pl-k">-</span> int64(jobSize))
+      results.Add((qlens, jobSize, selectedServerIdx, p, delay))
+   <span class="pl-k">return</span> (Some results)      <span class="pl-c">// return the delays experienced</span>
+<span class="pl-k">}</span>
+
+<span class="pl-k">let</span> <span class="pl-smi">results</span> <span class="pl-k">=</span>
+   <span class="pl-k">[</span>receiver<span class="pl-k">;</span> sender<span class="pl-k">]</span>
+   <span class="pl-k">|&gt;</span> Async.Parallel
+   <span class="pl-k">|&gt;</span> Async.RunSynchronously
+   <span class="pl-k">|&gt;</span> Array.head</pre></div>
+
+<h5>
+<a id="cool-thing-2-pipe-magic" class="anchor" href="#cool-thing-2-pipe-magic" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Cool thing #2: Pipe Magic</h5>
+
+<p>The forward pipe operator <code>|&gt;</code> really helps make the code concise and highly readable. Here is the code that runs a number of clients in parallel, waits for them to finish, collects their results, sifts through them, builds a CDF of message delays, and graphs it.</p>
+
+<div class="highlight highlight-source-fsharp"><pre><span class="pl-k">[|</span> <span class="pl-c1">1.</span>.config.numClients <span class="pl-k">|]</span>
+<span class="pl-k">|&gt;</span> Array.map(<span class="pl-k">fun</span> <span class="pl-v">i</span> <span class="pl-k">-&gt;</span> <span class="pl-k">async {</span> <span class="pl-k">return</span> Client.Run( <span class="pl-c"><span class="pl-c">(*</span> client params <span class="pl-c">*)</span></span> ) <span class="pl-k">}</span> )
+<span class="pl-k">|&gt;</span> Async.Parallel
+<span class="pl-k">|&gt;</span> Async.RunSynchronously
+<span class="pl-k">|&gt;</span> Array.fold (<span class="pl-k">fun</span> <span class="pl-v">accIn</span> <span class="pl-v">clientResults</span> <span class="pl-k">-&gt;</span> Array.append accIn (clientResults.ToArray<span class="pl-c1">()</span>)) <span class="pl-k">[||]</span>
+<span class="pl-k">|&gt;</span> Array.map (<span class="pl-k">fun</span> ((_, _, _, _, <span class="pl-v">experiencedDelay</span>)) <span class="pl-k">-&gt;</span> experiencedDelay)
+<span class="pl-k">|&gt;</span> Array.sort
+<span class="pl-k">|&gt;</span> Array.mapi (<span class="pl-k">fun</span> <span class="pl-v">i</span> <span class="pl-v">latency</span> <span class="pl-k">-&gt;</span> (<span class="pl-c1">100.0</span> <span class="pl-k">*</span> float(i<span class="pl-k">+</span><span class="pl-c1">1</span>) <span class="pl-k">/</span> float(config.msgsToSend), latency))
+<span class="pl-k">|&gt;</span> Chart.Line</pre></div>
+
+<p>The full test harness was not much bigger than this code above; there were a few lines of code to instantiate server processes and repeat the experiment a few times under different configuration parameters, but that was it! Running experiments in a few lines of code is pretty damn awesome!</p>
+
+<h5>
+<a id="cool-thing-3-start-running-quicker-and-with-fewer-errors" class="anchor" href="#cool-thing-3-start-running-quicker-and-with-fewer-errors" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Cool thing #3: Start Running Quicker and with Fewer Errors</h5>
+
+<p>F# is a strongly typed language with static type inference. This really helps me as a programmer not mess up--and I need that because writing and debugging distributed systems is hard enough as it is. Processing a list or an array? The type system will make sure you think about what happens if it is empty. Processing something that may or may not contain a value? Option types force you to think about both cases. Calling a function that returns a non-unit value? You have to explicitly state when you're ignoring the returned value. This resulted in fewer errors and a quicker time to play and experiment with my system.</p>
+
+<p>All in all, yay F#! <g-emoji alias="raised_hands" fallback-src="https://assets-cdn.github.com/images/icons/emoji/unicode/1f64c.png" ios-version="6.0">🙌</g-emoji></p>
+      </section>
+    </div>
+
+    <!-- FOOTER  -->
+    <div id="footer_wrap" class="outer">
+      <footer class="inner">
+        <p class="copyright">How F# delighted this newbie while experimenting with distributed systems maintained by <a href="https://github.com/hussam">hussam</a></p>
+        <p>Published with <a href="https://pages.github.com">GitHub Pages</a></p>
+      </footer>
+    </div>
+
+    
+
+  </body>
+</html>
